@@ -394,10 +394,10 @@ hrealloc(void* prev, size_t size)
 	}
 	
 	// else hmalloc and copy, then hfree
+	pthread_mutex_unlock(&mutex);
 	void* new_mem = hmalloc(size);
 	int rv = *((int*)memcpy(new_mem, prev, current_size));
 	hfree(prev);	
-	pthread_mutex_unlock(&mutex);
 	printf("Done.\n");
 	return new_mem;
 }

@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <string.h>
 
 #include "hmalloc.h"
 
@@ -29,6 +31,8 @@ typedef struct header {
 
 const size_t PAGE_SIZE = 4096;
 static hm_stats stats; // This initializes the stats to 0.
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; 
 static free_cell* free_list_head;
 
 void
@@ -303,9 +307,27 @@ split_and_remove_cell(free_cell* cell, size_t size)
 	}
 }
 
+free_cell*
+free_cell_at_address(void* addr)
+{
+	free_cell* current = free_list_head;
+	while ((void*)current < addr) {
+		if (current == 0) {
+			return 0;
+		}
+		current = current->next;
+	}
+	if (current == addr) {
+		return current;
+	} else {
+		return 0;
+	}
+}
+
 void*
 hmalloc(size_t size)
 {
+	pthread_mutex_lock(&mutex);
 	stats.chunks_allocated += 1;
 	size += sizeof(size_t);
 	
@@ -328,12 +350,14 @@ hmalloc(size_t size)
 	// return the properly incremented pointer
 	header* h = (header*) cell;
 	h->size = size;
+	pthread_mutex_unlock(&mutex);
 	return ((void*) h) + sizeof(size_t);
 }
 
 void
 hfree(void* item)
 {
+	pthread_mutex_lock(&mutex);
 	stats.chunks_freed += 1;
 	header* h = (header*) (item - sizeof(size_t));
 	size_t size = h->size;
@@ -344,5 +368,36 @@ hfree(void* item)
 	} else {
 		deallocate_pages(h);
 	}
+	pthread_mutex_unlock(&mutex);
 }
 
+void*
+hrealloc(void* prev, size_t size)
+{
+	pthread_mutex_lock(&mutex);
+	// if free after, expand...
+	printf("Realloc.\n");
+	size_t current_size = *((long*) (prev - sizeof(size_t)));
+	void* next_cell = prev + current_size;
+	
+	free_cell* available =  free_cell_at_address(next_cell);
+	
+	if (available != 0 && available->size + current_size <= size) {
+		split_and_remove_cell(available, size - current_size);
+		available->size = 0;
+		available->next = 0;
+		available->prev = 0;
+		*((long*) (prev - sizeof(size_t))) = size;
+		pthread_mutex_unlock(&mutex);
+		printf("Done.\n");
+		return prev;
+	}
+	
+	// else hmalloc and copy, then hfree
+	void* new_mem = hmalloc(size);
+	int rv = *((int*)memcpy(new_mem, prev, current_size));
+	hfree(prev);	
+	pthread_mutex_unlock(&mutex);
+	printf("Done.\n");
+	return new_mem;
+}

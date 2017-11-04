@@ -7,10 +7,13 @@ HDRS := $(wildcard *.h)
 SRCS := $(wildcard *.c)
 OBJS := $(SRCS:.c=.o)
 
-CFLAGS := -g
-LDLIBS := -lpthread
+CFLAGS := -g -std=gnu99
+LDLIBS := -lpthread -lm 
 
 all: $(BINS)
+
+try: opt_try.o optmalloc.o
+	gcc $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 collatz-list-sys: list_main.o sys_malloc.o
 	gcc $(CFLAGS) -o $@ $^ $(LDLIBS)

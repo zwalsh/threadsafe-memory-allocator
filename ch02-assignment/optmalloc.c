@@ -1,10 +1,13 @@
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <string.h>
+#include <math.h>
+#include <stdint.h>
 
 #include "optmalloc.h"
 
@@ -21,7 +24,6 @@
 typedef struct free_cell {
 	size_t size;
 	struct free_cell* next;
-	struct free_cell* prev;
 } free_cell;
 
 typedef struct header {
@@ -30,10 +32,35 @@ typedef struct header {
 
 
 const size_t PAGE_SIZE = 4096;
+const bool DEBUG = false;
 static hm_stats stats; // This initializes the stats to 0.
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; 
-static free_cell* free_list_head;
+typedef struct bin {
+	size_t size;
+	free_cell* first;
+	void* unalloc;
+	pthread_mutex_t mutex;
+} bin;
+
+typedef struct page_header {
+	size_t size;
+	long thread;
+} page_header;
+
+pthread_key_t arena_key;
+__thread bin* ar;
+
+bin*
+arena() {
+	return ar;
+/*
+	bin* arena = pthread_getspecific(arena_key);
+	if (arena == NULL) {
+		printf("NULL in key! for thread: %lu.\n", pthread_self());
+	}
+	return pthread_getspecific(arena_key);
+*/
+}
 
 void
 check_rv(int rv)
@@ -42,7 +69,6 @@ check_rv(int rv)
 		perror("Whoops");
 	}
 }
-
 
 long
 free_list_length_from(free_cell* cell, long acc)
@@ -53,23 +79,10 @@ free_list_length_from(free_cell* cell, long acc)
 	return free_list_length_from(cell->next, acc + 1);
 }
 
-long
-free_list_length()
-{
-	return free_list_length_from(free_list_head, 0);
-}
-
-hm_stats*
-hgetstats()
-{
-    stats.free_length = free_list_length();
-    return &stats;
-}
-
 void
 hprintstats()
 {
-    stats.free_length = free_list_length();
+    stats.free_length = 0;
     fprintf(stderr, "\n== husky malloc stats ==\n");
     fprintf(stderr, "Mapped:   %ld\n", stats.pages_mapped);
     fprintf(stderr, "Unmapped: %ld\n", stats.pages_unmapped);
@@ -104,7 +117,6 @@ add_memory()
 					MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	cell->size = PAGE_SIZE;
 	cell->next = 0;
-	cell->prev = 0;
 	return cell;
 }
 
@@ -131,29 +143,6 @@ deallocate_pages(header* h)
 }
 
 /**
- * Inserts the cell to add into the free list before the current cell.
- */
-void
-insert_before(free_cell* current, free_cell* to_add)
-{
-	assert(current != 0 && to_add != 0);
-	if (current->prev == 0) {
-		// current cell is the free_list_head.
-		free_list_head = to_add;
-		to_add->next = current;
-		to_add->prev = 0;
-		current->prev = to_add;
-		return;
-	}
-	free_cell* prior_cell = current->prev;
-	prior_cell->next = to_add;
-	to_add->prev = prior_cell;
-	
-	current->prev = to_add;
-	to_add->next = current;
-}
-
-/**
  *  Inserts the cell to add into the free list after the current cell.
  */
 void
@@ -162,28 +151,14 @@ insert_after(free_cell* current, free_cell* to_add)
 	assert(current != 0 && to_add != 0);
 	if (current->next == 0) {
 		current->next = to_add;
-		to_add->prev = current;
 		to_add->next = 0;
 		return;
 	}
 	free_cell* next_cell = current->next;
-	next_cell->prev = to_add;
 	to_add->next = next_cell;
 
 	current->next = to_add;
-	to_add->prev = current;
 }
-
-void
-merge_cells(free_cell* c1, free_cell* c2)
-{
-	c1->size = c1->size + c2->size;
-	c1->next = c2->next;
-	if (c1->next != 0) {
-		c1->next->prev = c1;
-	}
-}
-
 
 bool
 check_adjacent(free_cell* c1, free_cell* c2)
@@ -191,191 +166,161 @@ check_adjacent(free_cell* c1, free_cell* c2)
 	return (((void*) c1) + c1->size) == c2;
 }
 
-/**
- * Coalesces contiguous free cells in the list, checking at the current
- * cell to see if it touches the previous and next chunks.
- */
 void
-coalesce_at_cell(free_cell* cell)
+initialize_bin(bin* b, size_t size)
 {
-	free_cell* prev = cell->prev;
-	if (prev != 0 && check_adjacent(prev, cell)) {
-		merge_cells(prev, cell);
-		cell = prev;
-	}	
-	free_cell* next = cell->next;
-	if (next != 0 && check_adjacent(cell, next)) {
-		merge_cells(cell, next);
+	if (DEBUG) {
+		printf("init_bin(): thread: %lu, bin_size: %lu.\n", pthread_self(), size);
+	}
+	b->size = size;
+	b->first = 0;
+	pthread_mutex_init(&(b->mutex), NULL);
+}
+
+int
+size_for_bin_number(int i)
+{
+	assert(i >= 0);
+	if (i == 0) {
+		return 24;
+	}
+	return pow(2, (i + 4)); // Now 1->32 and each successive bin will contain the next
+}
+
+
+void
+initialize_arena() 
+{
+	if (DEBUG) {
+		printf("init_arena(): thread: %lu.\n", pthread_self());
+	}
+	// set arena variable
+	bin* a = (bin*) mmap(0, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	ar = a;
+//	int rv = pthread_setspecific(arena_key, a);
+//	check_rv(rv);
+	if (arena() == NULL) {
+		printf("We just put this here and it's gone!! thread: %lu.\n", pthread_self());
+	}
+	// configure a bin for 24, then powers of 2 up to 4096
+	int bin_index = 0;
+	size_t bin_size = size_for_bin_number(bin_index);
+	while (bin_size <= PAGE_SIZE) {
+		initialize_bin((a + bin_index), bin_size);
+		bin_index++;
+		bin_size = size_for_bin_number(bin_index);
 	}
 }
 
-/**
- * Inserts the given chunk of memory into the free list.
- * Maintains sorted order by address.
- * Coalesces contiguous chunks of free memory.
- */
-void
-insert_chunk_into_list(header* h)
+
+bin*
+pick_bin(bin* arena, size_t size) {
+	if(DEBUG) {
+		printf("pick bin: thread: %lu, size %lu.\n", pthread_self(), size);
+	}
+
+
+	bin* current = arena;
+	while(current->size < size) {
+		current = current + 1;
+	}
+
+
+	if(DEBUG) {
+		printf("pick bin: thread: %lu, bin of size %lu.\n", pthread_self(), current->size);
+	}
+
+	
+	return current;
+
+	
+}
+
+void*
+get_page_start(void* ptr)
 {
-	size_t size = h->size;
-	free_cell* cell = (free_cell*) h;
-	cell->size = size;
-	cell->prev = 0;
-	cell->next = 0;
-	if (free_list_head == 0) {
-		free_list_head = cell;
-		// don't have to coalesce here - the free list is empty.
-		return;
+	uintptr_t addr = (uintptr_t) ptr;
+	int offset_in_page = addr % PAGE_SIZE;
+	return ptr - offset_in_page;
+}
+
+void*
+get_chunk(bin* b) {
+	if (DEBUG) {
+		printf("get chunk: thread: %lu, bin size: %lu.\n", pthread_self(), b->size);
+	}
+
+	pthread_mutex_lock(&(b->mutex));
+	
+
+	if (b->first == NULL) {	
+		page_header* pg = (page_header*) allocate_pages(1);
+		pg->size = b->size;
+		pg->thread = pthread_self();
+		//set first
+		b->first = (free_cell*) (pg + 1);
+		//set unalloc
+		b->unalloc = b->first + 1;
 	}
 	
-	free_cell* current = free_list_head;
-	while (current < cell) {
-		if (current->next == 0) {
-			insert_after(current, cell);
-			coalesce_at_cell(cell);
-			return;
-		}
-		current = current->next;
-	}
-	insert_before(current, cell);
-	coalesce_at_cell(cell);
-
-}
-
-/**
- * Returns the first cell of the given size,
- * obtaining new memory if necessary.
- */
-free_cell*
-first_cell_of_size(size_t size) 
-{
-	assert(size < PAGE_SIZE);
-
-	if (free_list_head == 0) {
-		free_list_head = add_memory();
-		free_list_head->prev = 0;
-		free_list_head->next = 0;
-		return free_list_head;
-	}
-
-	free_cell* current = free_list_head;
-	while (current != 0 && current->size < size) {
-		current = current->next;
-	}
-	if (current == 0) {
-		free_cell* more_mem = add_memory();
-		insert_chunk_into_list((header*)more_mem);
-		return more_mem;
-	} else {
-		return current;
-	}
-}
-
-void
-split_and_remove_cell(free_cell* cell, size_t size) 
-{
-	assert(cell != 0);
-	if (cell->size - size > sizeof(free_cell)) {
-		free_cell* split =(free_cell*) (((void*)cell) + size);
-		split->size = cell->size - size;
-		split->next = cell->next;
-		split->prev = cell->prev;
-		if (cell->prev != 0) {
-			cell->prev->next = split;
+	free_cell* cell_to_return = b->first;
+	b->first = b->first->next;
+	if (b->first == NULL && b->unalloc != NULL) {
+		//handle unalloc pointer
+		b->first = b->unalloc;
+		void* page_start = get_page_start(b->unalloc);
+		void* next_unalloc = b->unalloc + b->size;
+		if (next_unalloc > page_start + PAGE_SIZE - b->size) {
+			b->unalloc = NULL;
 		} else {
-			free_list_head = split;
+			b->unalloc = next_unalloc;
 		}
-		if (cell->next != 0) {
-			cell->next->prev = split;
-		}
-		return;
-	} 
-
-	// Cell was too small to split
-	
-
-	if (cell->prev != 0 && cell->next != 0) { // in middle of list
-		cell->prev->next = cell->next;
-		cell->next->prev = cell->prev;
-	} else if (cell->prev == 0 && cell->next != 0) { // at front of list
-		free_list_head = cell->next;
-		free_list_head->prev = 0;
-	} else if (cell->prev != 0 && cell->next == 0) { // at end of list
-		cell->prev->next = 0;
-	} else { // only item in list
-		free_list_head = 0;
 	}
-}
 
-free_cell*
-free_cell_at_address(void* addr)
-{
-	free_cell* current = free_list_head;
-	while ((void*)current < addr) {
-		if (current == 0) {
-			return 0;
-		}
-		current = current->next;
-	}
-	if (current == addr) {
-		return current;
-	} else {
-		return 0;
-	}
+	pthread_mutex_unlock(&(b->mutex));
+	return cell_to_return;
 }
 
 void*
 opt_malloc(size_t size)
 {
-	pthread_mutex_lock(&mutex);
+	if (DEBUG) {
+		printf("malloc(): thread: %lu, size: %lu.\n", pthread_self(), size);
+	}
 	stats.chunks_allocated += 1;
-	size += sizeof(size_t);
+	if (arena_key == 0) {
+		int rv = pthread_key_create(&arena_key, NULL);
+		check_rv(rv);
+	}
 	
-	if (size < sizeof(free_cell)) {
-		size = sizeof(free_cell);
+	if (arena() == 0) {
+		initialize_arena();
 	}
-
+	
 	if (size >= PAGE_SIZE) {
-		size_t num_pages = div_up(size, PAGE_SIZE);
-		header* h = (header*) allocate_pages(num_pages);
-		h->size = size;
-		return ((void*) h) + sizeof(size_t);
+		int num_pages = div_up(size, PAGE_SIZE);
+		return allocate_pages(num_pages);
+		
 	}
 
-	// obtain a cell of the necessary size
-	free_cell* cell = first_cell_of_size(size);
+	bin* correct_bin = pick_bin(arena(), size);
 
-	// remove this cell from the free list
-	split_and_remove_cell(cell, size);
-	// return the properly incremented pointer
-	header* h = (header*) cell;
-	h->size = size;
-	pthread_mutex_unlock(&mutex);
-	return ((void*) h) + sizeof(size_t);
+	void* return_chunk = get_chunk(correct_bin);	
+	return return_chunk;
 }
 
 void
 opt_free(void* item)
 {
-	pthread_mutex_lock(&mutex);
 	stats.chunks_freed += 1;
 	header* h = (header*) (item - sizeof(size_t));
 	size_t size = h->size;
-	
-
-	if (size < PAGE_SIZE) {
-		insert_chunk_into_list(h);
-	} else {
-		deallocate_pages(h);
-	}
-	pthread_mutex_unlock(&mutex);
 }
 
 void*
 opt_realloc(void* prev, size_t size)
 {
-	pthread_mutex_lock(&mutex);
-	// if free after, expand...
+	/*// if free after, expand...
 	printf("Realloc.\n");
 	size_t current_size = *((long*) (prev - sizeof(size_t)));
 	void* next_cell = prev + current_size;
@@ -398,6 +343,6 @@ opt_realloc(void* prev, size_t size)
 	void* new_mem = opt_malloc(size);
 	int rv = *((int*)memcpy(new_mem, prev, current_size));
 	opt_free(prev);	
-	printf("Done.\n");
-	return new_mem;
+	printf("Done.\n");*/
+	return prev;
 }

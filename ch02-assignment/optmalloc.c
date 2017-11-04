@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "optmalloc.h"
 
@@ -39,7 +40,7 @@ typedef struct bin {
 	size_t size;
 	free_cell* first;
 	void* unalloc;
-	pthread_mutex_t mutex;
+//	pthread_mutex_t mutex;
 } bin;
 
 typedef struct page_header {
@@ -49,6 +50,22 @@ typedef struct page_header {
 
 pthread_key_t arena_key;
 __thread bin* ar;
+
+
+typedef struct cache {
+	long thread;
+	free_cell* first;
+	pthread_mutex_t mutex;
+} cache;
+
+typedef struct cache_list {
+	cache* c;
+	struct cache_list* next;
+} cache_list;
+
+cache_list* caches = NULL;
+
+
 
 bin*
 arena() {
@@ -174,7 +191,7 @@ initialize_bin(bin* b, size_t size)
 	}
 	b->size = size;
 	b->first = 0;
-	pthread_mutex_init(&(b->mutex), NULL);
+	//pthread_mutex_init(&(b->mutex), NULL);
 }
 
 int
@@ -210,17 +227,33 @@ initialize_arena()
 		bin_index++;
 		bin_size = size_for_bin_number(bin_index);
 	}
+
+
+
+	cache_list* cl = (cache_list*) (a + bin_index);
+
+	cache* c = (cache*) (cl + 1);
+	
+	cl->c = c;
+	cl->next = caches;
+	caches = cl;
+
+
+	c->thread = pthread_self();
+	c->first = NULL;
+	pthread_mutex_init(&(c->mutex), NULL);
+	
 }
 
 
 bin*
-pick_bin(bin* arena, size_t size) {
+pick_bin(size_t size) {
 	if(DEBUG) {
 		printf("pick bin: thread: %lu, size %lu.\n", pthread_self(), size);
 	}
 
 
-	bin* current = arena;
+	bin* current = arena();
 	while(current->size < size) {
 		current = current + 1;
 	}
@@ -250,7 +283,7 @@ get_chunk(bin* b) {
 		printf("get chunk: thread: %lu, bin size: %lu.\n", pthread_self(), b->size);
 	}
 
-	pthread_mutex_lock(&(b->mutex));
+	//pthread_mutex_lock(&(b->mutex));
 	
 
 	if (b->first == NULL) {	
@@ -277,7 +310,7 @@ get_chunk(bin* b) {
 		}
 	}
 
-	pthread_mutex_unlock(&(b->mutex));
+//	pthread_mutex_unlock(&(b->mutex));
 	return cell_to_return;
 }
 
@@ -303,46 +336,82 @@ opt_malloc(size_t size)
 		
 	}
 
-	bin* correct_bin = pick_bin(arena(), size);
+	bin* correct_bin = pick_bin(size);
 
 	void* return_chunk = get_chunk(correct_bin);	
 	return return_chunk;
+}
+
+
+cache*
+find_cache(long tn) 
+{
+	cache_list* current_l = caches;
+	cache* current_c = current_l->c;
+	while(current_c->thread != tn) {
+		current_l = current_l->next;
+		if (current_l == NULL) {
+			exit(1);
+		}
+		current_c = current_l->c;
+	}
+	return current_c;
+}
+
+
+void
+add_to_bin(free_cell* current, bin* correct_bin) {
+	
+
+	free_cell* temp = correct_bin->first;
+	correct_bin->first = current;
+	current->next = temp;
+}
+
+
+void
+clear_cache(cache* c)
+{
+
+	while(c->first != NULL) {
+		free_cell* current = c->first;
+		c->first = current->next;
+		page_header* ph =(page_header*) get_page_start(current);
+		size_t size_chunk = ph->size;
+		bin* correct_bin = pick_bin(size_chunk);
+		add_to_bin(current, correct_bin);
+	}				
+
 }
 
 void
 opt_free(void* item)
 {
 	stats.chunks_freed += 1;
-	header* h = (header*) (item - sizeof(size_t));
-	size_t size = h->size;
+	page_header* page_start = (page_header*) get_page_start(item);
+	long thread_num = page_start->thread;
+	
+	cache* correct_cache = find_cache(thread_num);
+
+	free_cell* fc = (free_cell*) item;
+	
+	pthread_mutex_lock(&correct_cache->mutex);
+	fc->next = correct_cache->first;
+	correct_cache->first = fc;
+
+	if (thread_num == pthread_self()) {
+		clear_cache(correct_cache);
+	}
+	pthread_mutex_unlock(&correct_cache->mutex);
 }
 
 void*
 opt_realloc(void* prev, size_t size)
 {
-	/*// if free after, expand...
-	printf("Realloc.\n");
-	size_t current_size = *((long*) (prev - sizeof(size_t)));
-	void* next_cell = prev + current_size;
-	
-	free_cell* available =  free_cell_at_address(next_cell);
-	
-	if (available != 0 && available->size + current_size <= size) {
-		split_and_remove_cell(available, size - current_size);
-		available->size = 0;
-		available->next = 0;
-		available->prev = 0;
-		*((long*) (prev - sizeof(size_t))) = size;
-		pthread_mutex_unlock(&mutex);
-		printf("Done.\n");
-		return prev;
-	}
-	
-	// else hmalloc and copy, then hfree
-	pthread_mutex_unlock(&mutex);
 	void* new_mem = opt_malloc(size);
-	int rv = *((int*)memcpy(new_mem, prev, current_size));
-	opt_free(prev);	
-	printf("Done.\n");*/
-	return prev;
+	page_header* pg = (page_header*) get_page_start(prev);
+	size_t old_size = pg->size;
+	memcpy(new_mem, prev, old_size);
+	opt_free(prev);
+	return new_mem;
 }

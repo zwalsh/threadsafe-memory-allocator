@@ -23,7 +23,6 @@
 */
 
 typedef struct free_cell {
-	size_t size;
 	struct free_cell* next;
 } free_cell;
 
@@ -49,7 +48,7 @@ typedef struct page_header {
 } page_header;
 
 pthread_key_t arena_key;
-__thread bin* ar;
+__thread bin* arena;
 
 
 typedef struct cache {
@@ -64,20 +63,6 @@ typedef struct cache_list {
 } cache_list;
 
 cache_list* caches = NULL;
-
-
-
-bin*
-arena() {
-	return ar;
-/*
-	bin* arena = pthread_getspecific(arena_key);
-	if (arena == NULL) {
-		printf("NULL in key! for thread: %lu.\n", pthread_self());
-	}
-	return pthread_getspecific(arena_key);
-*/
-}
 
 void
 check_rv(int rv)
@@ -124,19 +109,6 @@ div_up(size_t xx, size_t yy)
     }
 }
 
-free_cell*
-add_memory()
-{
-	stats.pages_mapped += 1;
-	free_cell* cell = (free_cell*) mmap(0, 
-					PAGE_SIZE,
-					PROT_READ|PROT_WRITE,
-					MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	cell->size = PAGE_SIZE;
-	cell->next = 0;
-	return cell;
-}
-
 void*
 allocate_pages(size_t num_pages)
 {
@@ -159,30 +131,6 @@ deallocate_pages(header* h)
 	check_rv(rv);
 }
 
-/**
- *  Inserts the cell to add into the free list after the current cell.
- */
-void
-insert_after(free_cell* current, free_cell* to_add)
-{
-	assert(current != 0 && to_add != 0);
-	if (current->next == 0) {
-		current->next = to_add;
-		to_add->next = 0;
-		return;
-	}
-	free_cell* next_cell = current->next;
-	to_add->next = next_cell;
-
-	current->next = to_add;
-}
-
-bool
-check_adjacent(free_cell* c1, free_cell* c2)
-{
-	return (((void*) c1) + c1->size) == c2;
-}
-
 void
 initialize_bin(bin* b, size_t size)
 {
@@ -191,7 +139,6 @@ initialize_bin(bin* b, size_t size)
 	}
 	b->size = size;
 	b->first = 0;
-	//pthread_mutex_init(&(b->mutex), NULL);
 }
 
 int
@@ -212,25 +159,18 @@ initialize_arena()
 		printf("init_arena(): thread: %lu.\n", pthread_self());
 	}
 	// set arena variable
-	bin* a = (bin*) mmap(0, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	ar = a;
-//	int rv = pthread_setspecific(arena_key, a);
-//	check_rv(rv);
-	if (arena() == NULL) {
-		printf("We just put this here and it's gone!! thread: %lu.\n", pthread_self());
-	}
+	arena = (bin*) allocate_pages(1);
+	
 	// configure a bin for 24, then powers of 2 up to 4096
 	int bin_index = 0;
 	size_t bin_size = size_for_bin_number(bin_index);
 	while (bin_size <= PAGE_SIZE) {
-		initialize_bin((a + bin_index), bin_size);
+		initialize_bin((arena + bin_index), bin_size);
 		bin_index++;
 		bin_size = size_for_bin_number(bin_index);
 	}
 
-
-
-	cache_list* cl = (cache_list*) (a + bin_index);
+	cache_list* cl = (cache_list*) (arena + bin_index);
 
 	cache* c = (cache*) (cl + 1);
 	
@@ -242,31 +182,31 @@ initialize_arena()
 	c->thread = pthread_self();
 	c->first = NULL;
 	pthread_mutex_init(&(c->mutex), NULL);
-	
 }
 
 
 bin*
 pick_bin(size_t size) {
 	if(DEBUG) {
-		printf("pick bin: thread: %lu, size %lu.\n", pthread_self(), size);
+//		printf("pick bin: thread: %lu, size %lu.\n", pthread_self(), size);
 	}
 
+	if (size > PAGE_SIZE) {
+		printf("Cannot use bins for sizes bigger than a page!\n");
+	}
 
-	bin* current = arena();
+	bin* current = arena;
 	while(current->size < size) {
 		current = current + 1;
 	}
 
 
 	if(DEBUG) {
-		printf("pick bin: thread: %lu, bin of size %lu.\n", pthread_self(), current->size);
+//		printf("pick bin: thread: %lu, bin of size %lu.\n", pthread_self(), current->size);
 	}
 
 	
 	return current;
-
-	
 }
 
 void*
@@ -283,17 +223,20 @@ get_chunk(bin* b) {
 		printf("get chunk: thread: %lu, bin size: %lu.\n", pthread_self(), b->size);
 	}
 
-	//pthread_mutex_lock(&(b->mutex));
-	
-
 	if (b->first == NULL) {	
 		page_header* pg = (page_header*) allocate_pages(1);
 		pg->size = b->size;
 		pg->thread = pthread_self();
 		//set first
 		b->first = (free_cell*) (pg + 1);
+		b->first->next = NULL;
+	//	printf("Pg: %p, first: %p, size: %lu.\n", pg, b->first, sizeof(page_header));
 		//set unalloc
-		b->unalloc = b->first + 1;
+		b->unalloc = (void*) (b->first) + b->size;
+	}
+	
+	if (b->first == 0x10) {
+		printf("b->first is 0x10!\n");
 	}
 	
 	free_cell* cell_to_return = b->first;
@@ -310,7 +253,10 @@ get_chunk(bin* b) {
 		}
 	}
 
-//	pthread_mutex_unlock(&(b->mutex));
+	if (DEBUG) {
+		printf("Got chunk: %p.\n", cell_to_return);
+	}
+	cell_to_return->next = 0;
 	return cell_to_return;
 }
 
@@ -326,19 +272,26 @@ opt_malloc(size_t size)
 		check_rv(rv);
 	}
 	
-	if (arena() == 0) {
+	if (arena == 0) {
 		initialize_arena();
 	}
 	
 	if (size >= PAGE_SIZE) {
+		size += sizeof(page_header);
 		int num_pages = div_up(size, PAGE_SIZE);
-		return allocate_pages(num_pages);
-		
+		page_header* ph = (page_header*) allocate_pages(num_pages);
+		ph->size = size;
+		ph->thread = pthread_self();
+		return (void*) (ph + 1);
 	}
 
 	bin* correct_bin = pick_bin(size);
 
 	void* return_chunk = get_chunk(correct_bin);	
+	if (return_chunk == 0x10) {
+		printf("Got chunk 0x10.\n");
+		exit(1);
+	}	
 	return return_chunk;
 }
 
@@ -372,7 +325,9 @@ add_to_bin(free_cell* current, bin* correct_bin) {
 void
 clear_cache(cache* c)
 {
-
+	if (DEBUG) {
+		printf("clear_cache(): for thread: %lu.\n", c->thread);
+	}	
 	while(c->first != NULL) {
 		free_cell* current = c->first;
 		c->first = current->next;
@@ -390,6 +345,15 @@ opt_free(void* item)
 	stats.chunks_freed += 1;
 	page_header* page_start = (page_header*) get_page_start(item);
 	long thread_num = page_start->thread;
+	long size = page_start->size;	
+	if (DEBUG) {
+		printf("free(): %p, from thread %lu, in thread %lu.\n", item, thread_num, pthread_self());
+	}
+	if (size > PAGE_SIZE) {
+		header* pages = (header*) (item - sizeof(page_header));
+		deallocate_pages(pages);
+		return;
+	}
 	
 	cache* correct_cache = find_cache(thread_num);
 

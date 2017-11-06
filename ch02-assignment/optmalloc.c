@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <string.h>
-#include <math.h>
+//#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -29,6 +29,10 @@ typedef struct free_cell {
 typedef struct header {
 	size_t size;
 } header;
+
+typedef struct extra_cell {
+	struct extra_cell* next;
+} extra_cell;
 
 
 const size_t PAGE_SIZE = 4096;
@@ -63,6 +67,8 @@ typedef struct cache_list {
 } cache_list;
 
 cache_list* caches = NULL;
+extra_cell* extra_memory = NULL;
+
 
 void
 check_rv(int rv)
@@ -141,6 +147,15 @@ initialize_bin(bin* b, size_t size)
 	b->first = 0;
 }
 
+int 
+power (int base, int exp)
+{	
+	int ans = 1;
+	for (int ii = 0; ii < exp; ++ii) {
+		ans = ans * base;
+	}
+}	
+
 int
 size_for_bin_number(int i)
 {
@@ -148,7 +163,7 @@ size_for_bin_number(int i)
 	if (i == 0) {
 		return 24;
 	}
-	return pow(2, (i + 4)); // Now 1->32 and each successive bin will contain the next
+	return power(2, (i + 4)); // Now 1->32 and each successive bin will contain the next
 }
 
 
@@ -217,22 +232,71 @@ get_page_start(void* ptr)
 	return ptr - offset_in_page;
 }
 
+
+void
+add_one_page_to_extra(void* start) {
+	if (extra_memory == NULL) {
+		extra_memory = (extra_cell*) start;
+		extra_memory->next = NULL;
+	}
+	
+	else {
+		extra_cell* extra = (extra_cell*)start;
+		extra->next = extra_memory;
+		extra_memory = extra;
+	}
+}
+	
+
+void
+add_extra_memory(void* pages_start, int num_to_alloc)  
+{
+	for (int ii = 0; ii < num_to_alloc; ++ii) {
+		add_one_page_to_extra(pages_start);
+		pages_start += PAGE_SIZE;
+	}
+	
+}
+
+void* 
+get_page_from_extra() {
+	
+	void* return_value = extra_memory;
+	extra_memory = extra_memory->next;
+	return return_value;
+}
+
+
 void*
 get_chunk(bin* b) {
 	if (DEBUG) {
 		printf("get chunk: thread: %lu, bin size: %lu.\n", pthread_self(), b->size);
 	}
 
-	if (b->first == NULL) {	
-		page_header* pg = (page_header*) allocate_pages(1);
+//this if and else if can be combined big time -- just say if extra memory is empty mmap, don't need both cases -
+//can totally change get-Page_from _extra to first check if null, call allocate pages if it is.
+
+	if (b->first == NULL && extra_memory == NULL) {	
+		int pages_to_allocate = 4;
+		page_header* pg = (page_header*) allocate_pages(pages_to_allocate);
 		pg->size = b->size;
 		pg->thread = pthread_self();
+		add_extra_memory((void*)pg + PAGE_SIZE, pages_to_allocate - 1);
 		//set first
 		b->first = (free_cell*) (pg + 1);
 		b->first->next = NULL;
 	//	printf("Pg: %p, first: %p, size: %lu.\n", pg, b->first, sizeof(page_header));
 		//set unalloc
 		b->unalloc = (void*) (b->first) + b->size;
+	}
+	
+	else if (b->first == NULL & extra_memory != NULL) {
+		page_header* ph = (page_header*) get_page_from_extra();
+		ph->size = b->size;
+		ph->thread = pthread_self();
+		b->first = (free_cell*) (ph + 1);
+		b->first->next = NULL;
+		b->unalloc = (void*) (b->first) + b->size;	
 	}
 	
 	if (b->first == 0x10) {

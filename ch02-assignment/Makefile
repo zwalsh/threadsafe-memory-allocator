@@ -12,9 +12,6 @@ LDLIBS := -lpthread -lm
 
 all: $(BINS)
 
-try: opt_try.o optmalloc.o
-	gcc $(CFLAGS) -o $@ $^ $(LDLIBS)
-
 collatz-list-sys: list_main.o sys_malloc.o
 	gcc $(CFLAGS) -o $@ $^ $(LDLIBS)
 

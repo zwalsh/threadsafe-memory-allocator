@@ -31,11 +31,13 @@ typedef struct bin {
 	size_t size;
 	free_cell* first;
 	void* unalloc;
+	int num_pages;
 } bin;
 
 typedef struct page_header {
 	size_t size;
 	int thread;
+	int bytes_allocated;
 } page_header;
 
 __thread bin* arena;
@@ -110,7 +112,9 @@ void
 initialize_bin(bin* b, size_t size)
 {
 	b->size = size;
-	b->first = 0;
+	b->first = NULL;
+	b->unalloc = NULL;
+	b->num_pages = 0;
 }
 
 int
@@ -209,6 +213,7 @@ get_page_from_extra()
 	}		
 		
 	page_header* return_value = (page_header*)extra_memory;
+	return_value->bytes_allocated = 0;
 	extra_memory = extra_memory->next;
 	return return_value;
 }
@@ -217,8 +222,10 @@ void*
 get_chunk(bin* b) {
 	if (b->first == NULL) {
 		page_header* pg = get_page_from_extra();
+		b->num_pages += 1;
 		pg->size = b->size;
 		pg->thread = thread_num;
+		pg->bytes_allocated = 0;
 		//set first
 		b->first = (free_cell*) (pg + 1);
 		b->first->next = NULL;
@@ -239,6 +246,9 @@ get_chunk(bin* b) {
 			b->unalloc = next_unalloc;
 		}
 	}
+	
+	page_header* pg = (page_header*) get_page_start(cell_to_return);
+	pg->bytes_allocated += b->size;
 
 	cell_to_return->next = 0;
 	return cell_to_return;
@@ -298,6 +308,30 @@ add_to_bin(free_cell* current, bin* correct_bin) {
 	current->next = temp;
 }
 
+void
+clean_page(page_header* ph)
+{
+	//printf("Cleaning page size: %lu in thread: %d.\n", ph->size, ph->thread);
+	bin* b = pick_bin(ph->size);
+	b->num_pages -= 1;
+	
+	free_cell* prev = NULL;
+	free_cell* current = b->first;
+	
+	while (current != NULL) {
+		if (ph == (page_header*) get_page_start(current)) {
+			if (prev != NULL) {
+				prev->next = current->next;
+			}	
+			current = current->next;
+		} else {
+			prev = current;
+			current = current->next;
+		}
+	}
+	add_one_page_to_extra(ph);
+}
+
 
 void
 clear_cache(cache* c)
@@ -306,9 +340,14 @@ clear_cache(cache* c)
 		free_cell* current = c->first;
 		c->first = current->next;
 		page_header* ph =(page_header*) get_page_start(current);
+		ph->bytes_allocated -= ph->size;
 		size_t size_chunk = ph->size;
 		bin* correct_bin = pick_bin(size_chunk);
 		add_to_bin(current, correct_bin);
+		//printf("Bytes allocated: %d\n", ph->bytes_allocated);
+		if (ph->bytes_allocated == 0 && correct_bin->num_pages > 2) {
+			clean_page(ph);
+		}
 	}				
 
 }
